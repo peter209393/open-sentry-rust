@@ -12,7 +12,8 @@
 SDK / curl -> Axum ingest API -> PostgreSQL
                                   |-- events (原始事件)
                                   |-- issues (聚合结果)
-                                  `-- notification_outbox -> Worker -> SMTP / Telegram
+                                  |-- releases / debug_files -> Symbol worker
+                                  `-- notification_outbox -> Worker -> Email / Telegram / Voice / Webhook
 
 Web UI -> Query API -> PostgreSQL
 ```
@@ -120,6 +121,11 @@ curl -X POST http://localhost:8080/api/projects/00000000-0000-0000-0000-00000000
 | `GET/PATCH` | `/api/issues/{id}` | Issue 详情/状态变更 |
 | `GET` | `/api/issues/{id}/events` | Issue 下的事件 |
 | `GET/POST` | `/api/projects/{id}/alert-rules` | 查询/创建告警规则 |
+| `GET/POST` | `/api/projects/{id}/releases` | Release 健康与版本管理 |
+| `GET/POST` | `/api/projects/{id}/debug-files` | Source Map / 原生符号管理 |
+| `GET/POST` | `/api/projects/{id}/webhooks` | HMAC 签名 Webhook 管理 |
+| `GET/POST` | `/api/projects/{id}/on-call-schedules` | 值班轮转管理 |
+| `GET/POST` | `/api/projects/{id}/escalation-policies` | 多级告警升级策略 |
 
 ## 生产能力与演进路线
 
@@ -138,11 +144,13 @@ Session 管理、Issue 服务端搜索/批量处理/评论/回归检测、项目
 周期，以及告警启停、测试、投递历史和失败重试。Project Key 原文不会写入数据库。
 高级工作流包括 Issue Merge/Split、手动 fingerprint、服务/release/时间游标筛选、
 48 小时一次性邀请链接、带 24 小时冷静期的项目永久删除、认证附件下载，以及窗口
-阈值告警、恢复通知和通知渠道配置检查。
+阈值告警、恢复通知和通知渠道配置检查。P1 已加入 Release/Deployment 健康与版本对比、
+JavaScript Source Map 解析、ELF/Mach-O 符号名解析、PDB 安全上传校验、事件重新处理、
+HMAC-SHA256 Webhook、值班表和失败后的多级升级投递。
 
 后续演进重点：
 
-1. **协议深度**：source map、release health、performance tracing 和 session replay。
+1. **协议深度**：PDB 行号解析、performance tracing 和 session replay。
 2. **可观测性**：OpenTelemetry trace、outbox 积压和通知失败主动告警。
 3. **规模化**：接入层后置 NATS/Kafka；事件明细进入 ClickHouse；PostgreSQL 保留租户、规则和 Issue 元数据。
 4. **安全增强**：外部密钥管理、可配置敏感字段 scrubbing、OIDC/SSO 和更细粒度权限策略。
@@ -164,7 +172,8 @@ scripts/production-acceptance.sh
 ## Web 控制台
 
 前端位于 `frontend/`，提供项目概览、Service 目录、结构化 Logs、Event 流、组合
-筛选、Issue 状态处理、Fix 修复上下文、事件时间线和原始 Envelope Item 监控。
+筛选、Issue 状态处理、Fix 修复上下文、Release/符号文件管理、Webhook 与值班升级、
+事件时间线和原始 Envelope Item 监控。
 
 ```bash
 cd frontend

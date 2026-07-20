@@ -75,6 +75,46 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/projects/{project_id}/overview", get(project_overview))
         .route(
+            "/api/projects/{project_id}/debug-files",
+            get(list_debug_files).post(upload_debug_file),
+        )
+        .route(
+            "/api/debug-files/{file_id}",
+            axum::routing::delete(delete_debug_file),
+        )
+        .route("/api/events/{event_id}/reprocess", post(reprocess_event))
+        .route(
+            "/api/projects/{project_id}/releases",
+            get(list_releases).post(create_release),
+        )
+        .route(
+            "/api/projects/{project_id}/releases/compare",
+            get(compare_releases),
+        )
+        .route("/api/releases/{release_id}", get(get_release))
+        .route(
+            "/api/releases/{release_id}/deployments",
+            post(create_deployment),
+        )
+        .route("/api/releases/{release_id}/health", get(release_health))
+        .route(
+            "/api/projects/{project_id}/webhooks",
+            get(list_webhooks).post(create_webhook),
+        )
+        .route(
+            "/api/webhooks/{endpoint_id}",
+            axum::routing::delete(delete_webhook),
+        )
+        .route("/api/webhooks/{endpoint_id}/test", post(test_webhook))
+        .route(
+            "/api/projects/{project_id}/on-call-schedules",
+            get(list_schedules).post(create_schedule),
+        )
+        .route(
+            "/api/projects/{project_id}/escalation-policies",
+            get(list_policies).post(create_policy),
+        )
+        .route(
             "/api/issues/{issue_id}",
             get(get_issue).patch(update_issue).post(fix_issue),
         )
@@ -365,6 +405,17 @@ async fn persist_event(
     .bind(&event.level).bind(&event.message).bind(&event.environment).bind(&event.release)
     .bind(&event.tags).bind(&event.contexts).bind(&event.exception).bind(occurred_at)
     .execute(&mut *tx).await?;
+
+    if let Some(release) = &event.release {
+        sqlx::query("INSERT INTO releases(project_id,version,first_event_at,last_event_at,event_count) VALUES($1,$2,$3,$3,1) ON CONFLICT(project_id,version) DO UPDATE SET first_event_at=LEAST(releases.first_event_at,EXCLUDED.first_event_at),last_event_at=GREATEST(releases.last_event_at,EXCLUDED.last_event_at),event_count=releases.event_count+1")
+            .bind(project_id).bind(release).bind(occurred_at).execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO symbolication_jobs(event_id) VALUES($1) ON CONFLICT(event_id) DO NOTHING",
+        )
+        .bind(event_id)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     alert::enqueue_matching_alerts(&mut tx, project_id, issue_id, event_id, &event).await?;
     tx.commit().await?;
@@ -1347,6 +1398,441 @@ async fn list_project_events(
     Ok(Json(rows))
 }
 
+async fn list_debug_files(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    let rows=sqlx::query_as::<_,(Uuid,String,String,Option<String>,String,String,Option<String>,chrono::DateTime<chrono::Utc>)>("SELECT d.id,d.kind,d.name,r.version,d.checksum,d.status,d.error,d.created_at FROM debug_files d LEFT JOIN releases r ON r.id=d.release_id WHERE d.project_id=$1 ORDER BY d.created_at DESC").bind(project_id).fetch_all(&state.db).await?;
+    Ok(Json(json!(rows.into_iter().map(|r|json!({"id":r.0,"kind":r.1,"name":r.2,"release":r.3,"checksum":r.4,"status":r.5,"error":r.6,"created_at":r.7})).collect::<Vec<_>>())))
+}
+async fn upload_debug_file(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<Value>)> {
+    let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    crate::auth::require_admin(&user)?;
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let kind = value("x-debug-file-kind")
+        .ok_or_else(|| AppError::BadRequest("x-debug-file-kind is required".into()))?;
+    let name = value("x-debug-file-name")
+        .ok_or_else(|| AppError::BadRequest("x-debug-file-name is required".into()))?;
+    let release =
+        value("x-release").ok_or_else(|| AppError::BadRequest("x-release is required".into()))?;
+    crate::symbols::validate_debug_file(&kind, &body)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let checksum = format!("{:x}", Sha256::digest(&body));
+    let release_id=sqlx::query_scalar::<_,Uuid>("INSERT INTO releases(project_id,version) VALUES($1,$2) ON CONFLICT(project_id,version) DO UPDATE SET version=EXCLUDED.version RETURNING id").bind(project_id).bind(&release).fetch_one(&state.db).await?;
+    let id=sqlx::query_scalar::<_,Uuid>("INSERT INTO debug_files(project_id,release_id,kind,name,debug_id,checksum,payload) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(project_id,checksum) DO UPDATE SET name=EXCLUDED.name RETURNING id").bind(project_id).bind(release_id).bind(&kind).bind(&name).bind(value("x-debug-id")).bind(&checksum).bind(body.as_ref()).fetch_one(&state.db).await?;
+    sqlx::query("UPDATE symbolication_jobs j SET status='pending',available_at=now(),last_error=NULL FROM events e WHERE j.event_id=e.id AND e.project_id=$1 AND e.release=$2").bind(project_id).bind(&release).execute(&state.db).await?;
+    crate::operations::audit(
+        &state.db,
+        &user,
+        "debug_file.uploaded",
+        "debug_file",
+        Some(id),
+        json!({"kind":kind,"release":release}),
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"id":id,"checksum":checksum,"status":"ready"})),
+    ))
+}
+async fn delete_debug_file(
+    State(state): State<Arc<AppState>>,
+    Path(file_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
+    let project_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT project_id FROM debug_files WHERE id=$1")
+            .bind(file_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(AppError::NotFound)?;
+    let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    crate::auth::require_admin(&user)?;
+    sqlx::query("DELETE FROM debug_files WHERE id=$1")
+        .bind(file_id)
+        .execute(&state.db)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn reprocess_event(
+    State(state): State<Arc<AppState>>,
+    Path(event_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
+    let project_id = sqlx::query_scalar::<_, Uuid>("SELECT project_id FROM events WHERE id=$1")
+        .bind(event_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    crate::auth::require_admin(&user)?;
+    sqlx::query("INSERT INTO symbolication_jobs(event_id,status,available_at) VALUES($1,'pending',now()) ON CONFLICT(event_id) DO UPDATE SET status='pending',available_at=now(),last_error=NULL").bind(event_id).execute(&state.db).await?;
+    sqlx::query("UPDATE events SET symbolication_status='pending' WHERE id=$1")
+        .bind(event_id)
+        .execute(&state.db)
+        .await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+struct CreateReleaseInput {
+    version: String,
+    description: Option<String>,
+}
+#[derive(Deserialize)]
+struct DeploymentInput {
+    environment: String,
+    name: Option<String>,
+    url: Option<String>,
+}
+#[derive(Deserialize)]
+struct CompareReleaseQuery {
+    base: String,
+    head: String,
+}
+async fn list_releases(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    let rows=sqlx::query_as::<_,(Uuid,String,Option<String>,i64,Option<chrono::DateTime<chrono::Utc>>,Option<chrono::DateTime<chrono::Utc>>,chrono::DateTime<chrono::Utc>)>("SELECT id,version,description,event_count,first_event_at,last_event_at,created_at FROM releases WHERE project_id=$1 ORDER BY COALESCE(last_event_at,created_at) DESC").bind(project_id).fetch_all(&state.db).await?;
+    Ok(Json(json!(rows.into_iter().map(|r|json!({"id":r.0,"version":r.1,"description":r.2,"event_count":r.3,"first_event_at":r.4,"last_event_at":r.5,"created_at":r.6})).collect::<Vec<_>>())))
+}
+async fn create_release(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<CreateReleaseInput>,
+) -> Result<(StatusCode, Json<Value>)> {
+    let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    crate::auth::require_admin(&user)?;
+    if body.version.trim().is_empty() {
+        return Err(AppError::BadRequest("version required".into()));
+    }
+    let id=sqlx::query_scalar::<_,Uuid>("INSERT INTO releases(project_id,version,description) VALUES($1,$2,$3) ON CONFLICT(project_id,version) DO UPDATE SET description=COALESCE(EXCLUDED.description,releases.description) RETURNING id").bind(project_id).bind(body.version.trim()).bind(body.description).fetch_one(&state.db).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"id":id,"version":body.version})),
+    ))
+}
+async fn get_release(
+    State(state): State<Arc<AppState>>,
+    Path(release_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    let row = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Uuid,
+            String,
+            Option<String>,
+            i64,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        "SELECT id,project_id,version,description,event_count,created_at FROM releases WHERE id=$1",
+    )
+    .bind(release_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    crate::auth::authorize_project(&state.db, &headers, row.1).await?;
+    let deployments=sqlx::query_as::<_,(Uuid,String,Option<String>,Option<String>,chrono::DateTime<chrono::Utc>)>("SELECT id,environment,name,url,deployed_at FROM deployments WHERE release_id=$1 ORDER BY deployed_at DESC").bind(release_id).fetch_all(&state.db).await?;
+    Ok(Json(
+        json!({"id":row.0,"project_id":row.1,"version":row.2,"description":row.3,"event_count":row.4,"created_at":row.5,"deployments":deployments.into_iter().map(|d|json!({"id":d.0,"environment":d.1,"name":d.2,"url":d.3,"deployed_at":d.4})).collect::<Vec<_>>()}),
+    ))
+}
+async fn create_deployment(
+    State(state): State<Arc<AppState>>,
+    Path(release_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<DeploymentInput>,
+) -> Result<(StatusCode, Json<Value>)> {
+    let project_id = sqlx::query_scalar::<_, Uuid>("SELECT project_id FROM releases WHERE id=$1")
+        .bind(release_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    crate::auth::require_admin(&user)?;
+    let id=sqlx::query_scalar::<_,Uuid>("INSERT INTO deployments(release_id,environment,name,url,deployed_by) VALUES($1,$2,$3,$4,$5) RETURNING id").bind(release_id).bind(body.environment).bind(body.name).bind(body.url).bind(user.id).fetch_one(&state.db).await?;
+    Ok((StatusCode::CREATED, Json(json!({"id":id}))))
+}
+async fn release_health(
+    State(state): State<Arc<AppState>>,
+    Path(release_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    let (project_id, version) =
+        sqlx::query_as::<_, (Uuid, String)>("SELECT project_id,version FROM releases WHERE id=$1")
+            .bind(release_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(AppError::NotFound)?;
+    crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    let points=sqlx::query_as::<_,(chrono::DateTime<chrono::Utc>,String,i64,i64)>("SELECT date_trunc('hour',occurred_at),COALESCE(environment,'default'),count(*)::bigint,count(DISTINCT issue_id)::bigint FROM events WHERE project_id=$1 AND release=$2 GROUP BY 1,2 ORDER BY 1").bind(project_id).bind(version).fetch_all(&state.db).await?;
+    Ok(Json(json!(
+        points
+            .into_iter()
+            .map(|p| json!({"bucket":p.0,"environment":p.1,"events":p.2,"issues":p.3}))
+            .collect::<Vec<_>>()
+    )))
+}
+async fn compare_releases(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+    Query(q): Query<CompareReleaseQuery>,
+) -> Result<Json<Value>> {
+    crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    let rows=sqlx::query_as::<_,(Uuid,String,String,bool,bool)>(r#"SELECT i.id,i.title,i.status,
+EXISTS(SELECT 1 FROM events e WHERE e.issue_id=i.id AND e.release=$2) base,
+EXISTS(SELECT 1 FROM events e WHERE e.issue_id=i.id AND e.release=$3) head
+FROM issues i WHERE i.project_id=$1 AND (EXISTS(SELECT 1 FROM events e WHERE e.issue_id=i.id AND e.release=$2) OR EXISTS(SELECT 1 FROM events e WHERE e.issue_id=i.id AND e.release=$3))"#).bind(project_id).bind(&q.base).bind(&q.head).fetch_all(&state.db).await?;
+    Ok(Json(
+        json!({"base":q.base,"head":q.head,"issues":rows.into_iter().map(|r|json!({"id":r.0,"title":r.1,"status":r.2,"classification":match(r.3,r.4){(false,true)=>"new",(true,true)=>"ongoing",(true,false)=>"fixed",_=>"unknown"}})).collect::<Vec<_>>()}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct CreateWebhookInput {
+    name: String,
+    url: String,
+}
+#[derive(Deserialize)]
+struct CreateScheduleInput {
+    name: String,
+    timezone: Option<String>,
+    members: Vec<Uuid>,
+}
+#[derive(Deserialize)]
+struct CreatePolicyInput {
+    name: String,
+    steps: Vec<CreateEscalationStepInput>,
+}
+#[derive(Deserialize)]
+struct CreateEscalationStepInput {
+    delay_seconds: i32,
+    channel: String,
+    target: Option<String>,
+    schedule_id: Option<Uuid>,
+}
+
+async fn list_webhooks(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    let rows=sqlx::query_as::<_,(Uuid,String,String,bool,chrono::DateTime<chrono::Utc>,i64)>(r#"SELECT w.id,w.name,w.url,w.enabled,w.created_at,count(d.id)::bigint FROM webhook_endpoints w LEFT JOIN webhook_deliveries d ON d.endpoint_id=w.id WHERE w.project_id=$1 GROUP BY w.id ORDER BY w.created_at DESC"#).bind(project_id).fetch_all(&state.db).await?;
+    Ok(Json(json!(rows.into_iter().map(|r|json!({"id":r.0,"name":r.1,"url":r.2,"enabled":r.3,"created_at":r.4,"delivery_count":r.5})).collect::<Vec<_>>())))
+}
+async fn create_webhook(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<CreateWebhookInput>,
+) -> Result<(StatusCode, Json<Value>)> {
+    let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    crate::auth::require_admin(&user)?;
+    let parsed = reqwest::Url::parse(body.url.trim())
+        .map_err(|_| AppError::BadRequest("valid webhook URL required".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") || body.name.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "name and an HTTP(S) URL are required".into(),
+        ));
+    }
+    let secret = format!(
+        "whsec_{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let id=sqlx::query_scalar::<_,Uuid>("INSERT INTO webhook_endpoints(project_id,name,url,signing_secret) VALUES($1,$2,$3,$4) RETURNING id").bind(project_id).bind(body.name.trim()).bind(parsed.as_str()).bind(&secret).fetch_one(&state.db).await?;
+    crate::operations::audit(
+        &state.db,
+        &user,
+        "webhook.created",
+        "webhook",
+        Some(id),
+        json!({"project_id":project_id}),
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"id":id,"signing_secret":secret,"shown_once":true})),
+    ))
+}
+async fn delete_webhook(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
+    let project_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT project_id FROM webhook_endpoints WHERE id=$1")
+            .bind(endpoint_id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or(AppError::NotFound)?;
+    let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    crate::auth::require_admin(&user)?;
+    sqlx::query("DELETE FROM webhook_endpoints WHERE id=$1")
+        .bind(endpoint_id)
+        .execute(&state.db)
+        .await?;
+    crate::operations::audit(
+        &state.db,
+        &user,
+        "webhook.deleted",
+        "webhook",
+        Some(endpoint_id),
+        json!({}),
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn test_webhook(
+    State(state): State<Arc<AppState>>,
+    Path(endpoint_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<Value>)> {
+    let row=sqlx::query_as::<_,(Uuid,Uuid)>("SELECT w.project_id,r.id FROM webhook_endpoints w JOIN alert_rules r ON r.project_id=w.project_id WHERE w.id=$1 ORDER BY r.created_at LIMIT 1").bind(endpoint_id).fetch_optional(&state.db).await?.ok_or_else(||AppError::BadRequest("create an alert rule before testing a webhook".into()))?;
+    let user = crate::auth::authorize_project(&state.db, &headers, row.0).await?;
+    crate::auth::require_admin(&user)?;
+    let id=sqlx::query_scalar::<_,Uuid>("INSERT INTO notification_outbox(rule_id,channel,target,payload) VALUES($1,'webhook',$2,$3) RETURNING id").bind(row.1).bind(endpoint_id.to_string()).bind(json!({"rule_name":"Webhook test","project_id":row.0,"test":true})).fetch_one(&state.db).await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({"notification_id":id}))))
+}
+async fn list_schedules(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    let rows=sqlx::query_as::<_,(Uuid,String,String,chrono::DateTime<chrono::Utc>,Value)>(r#"SELECT s.id,s.name,s.timezone,s.created_at,COALESCE(jsonb_agg(jsonb_build_object('user_id',u.id,'email',u.email,'display_name',u.display_name,'rotation_order',m.rotation_order) ORDER BY m.rotation_order) FILTER(WHERE u.id IS NOT NULL),'[]') FROM on_call_schedules s LEFT JOIN on_call_members m ON m.schedule_id=s.id LEFT JOIN users u ON u.id=m.user_id WHERE s.project_id=$1 GROUP BY s.id ORDER BY s.created_at DESC"#).bind(project_id).fetch_all(&state.db).await?;
+    Ok(Json(json!(
+        rows.into_iter()
+            .map(|r| json!({"id":r.0,"name":r.1,"timezone":r.2,"created_at":r.3,"members":r.4}))
+            .collect::<Vec<_>>()
+    )))
+}
+async fn create_schedule(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<CreateScheduleInput>,
+) -> Result<(StatusCode, Json<Value>)> {
+    let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    crate::auth::require_admin(&user)?;
+    if body.name.trim().is_empty() || body.members.is_empty() {
+        return Err(AppError::BadRequest(
+            "schedule name and at least one member are required".into(),
+        ));
+    }
+    let mut tx = state.db.begin().await?;
+    let id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO on_call_schedules(project_id,name,timezone) VALUES($1,$2,$3) RETURNING id",
+    )
+    .bind(project_id)
+    .bind(body.name.trim())
+    .bind(body.timezone.unwrap_or_else(|| "UTC".into()))
+    .fetch_one(&mut *tx)
+    .await?;
+    for (order, member) in body.members.into_iter().enumerate() {
+        let valid=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM users u JOIN projects p ON p.organization_id=u.organization_id WHERE u.id=$1 AND p.id=$2 AND u.active)").bind(member).bind(project_id).fetch_one(&mut *tx).await?;
+        if !valid {
+            return Err(AppError::BadRequest(
+                "schedule member is not an active project organization user".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO on_call_members(schedule_id,user_id,rotation_order) VALUES($1,$2,$3)",
+        )
+        .bind(id)
+        .bind(member)
+        .bind(order as i32)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(json!({"id":id}))))
+}
+async fn list_policies(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    let rows=sqlx::query_as::<_,(Uuid,String,chrono::DateTime<chrono::Utc>,Value)>(r#"SELECT p.id,p.name,p.created_at,COALESCE(jsonb_agg(jsonb_build_object('order',s.step_order,'delay_seconds',s.delay_seconds,'channel',s.channel,'target',s.target,'schedule_id',s.schedule_id) ORDER BY s.step_order) FILTER(WHERE s.id IS NOT NULL),'[]') FROM escalation_policies p LEFT JOIN escalation_steps s ON s.policy_id=p.id WHERE p.project_id=$1 GROUP BY p.id ORDER BY p.created_at DESC"#).bind(project_id).fetch_all(&state.db).await?;
+    Ok(Json(json!(
+        rows.into_iter()
+            .map(|r| json!({"id":r.0,"name":r.1,"created_at":r.2,"steps":r.3}))
+            .collect::<Vec<_>>()
+    )))
+}
+async fn create_policy(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<CreatePolicyInput>,
+) -> Result<(StatusCode, Json<Value>)> {
+    let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
+    crate::auth::require_admin(&user)?;
+    if body.name.trim().is_empty() || body.steps.is_empty() {
+        return Err(AppError::BadRequest(
+            "policy name and steps are required".into(),
+        ));
+    }
+    let mut tx = state.db.begin().await?;
+    let id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO escalation_policies(project_id,name) VALUES($1,$2) RETURNING id",
+    )
+    .bind(project_id)
+    .bind(body.name.trim())
+    .fetch_one(&mut *tx)
+    .await?;
+    for (order, step) in body.steps.into_iter().enumerate() {
+        if !matches!(
+            step.channel.as_str(),
+            "email" | "telegram" | "voice_call" | "webhook"
+        ) || (step.target.as_deref().unwrap_or("").is_empty() && step.schedule_id.is_none())
+        {
+            return Err(AppError::BadRequest(
+                "each policy step needs a supported channel and target or schedule".into(),
+            ));
+        }
+        if let Some(schedule) = step.schedule_id {
+            let valid = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM on_call_schedules WHERE id=$1 AND project_id=$2)",
+            )
+            .bind(schedule)
+            .bind(project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !valid {
+                return Err(AppError::BadRequest(
+                    "schedule does not belong to project".into(),
+                ));
+            }
+        }
+        sqlx::query("INSERT INTO escalation_steps(policy_id,step_order,delay_seconds,channel,target,schedule_id) VALUES($1,$2,$3,$4,$5,$6)").bind(id).bind(order as i32).bind(step.delay_seconds.max(0)).bind(step.channel).bind(step.target).bind(step.schedule_id).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(json!({"id":id}))))
+}
+
 async fn project_overview(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
@@ -1471,7 +1957,7 @@ async fn fix_issue(
     .bind(issue_id).fetch_optional(&state.db).await?.ok_or(AppError::NotFound)?;
     let events = sqlx::query_as::<_, StoredEvent>(
         r#"SELECT id, project_id, issue_id, level, message, environment, release, tags,
-                  contexts, exception, received_at, occurred_at
+                  contexts, exception, symbolicated_exception, symbolication_status, received_at, occurred_at
            FROM events WHERE issue_id=$1 ORDER BY occurred_at DESC LIMIT 5"#,
     )
     .bind(issue_id)
@@ -1509,7 +1995,7 @@ async fn list_events(
 ) -> Result<Json<Vec<StoredEvent>>> {
     crate::auth::authorize_issue(&state.db, &headers, issue_id).await?;
     let rows = sqlx::query_as::<_, StoredEvent>(
-        r#"SELECT id, project_id, issue_id, level, message, environment, release, tags, contexts, exception, received_at, occurred_at
+        r#"SELECT id, project_id, issue_id, level, message, environment, release, tags, contexts, exception, symbolicated_exception, symbolication_status, received_at, occurred_at
            FROM events WHERE issue_id = $1 ORDER BY occurred_at DESC LIMIT $2 OFFSET $3"#,
     ).bind(issue_id).bind(q.limit.unwrap_or(50).clamp(1, 200)).bind(q.offset.unwrap_or(0).max(0))
     .fetch_all(&state.db).await?;
@@ -1524,18 +2010,35 @@ async fn create_rule(
 ) -> Result<(StatusCode, Json<AlertRuleView>)> {
     let user = crate::auth::authorize_project(&state.db, &headers, project_id).await?;
     crate::auth::require_admin(&user)?;
-    if !matches!(rule.channel.as_str(), "email" | "telegram" | "voice_call") {
+    if !matches!(
+        rule.channel.as_str(),
+        "email" | "telegram" | "voice_call" | "webhook"
+    ) {
         return Err(AppError::BadRequest(
-            "channel must be email, telegram, or voice_call".into(),
+            "channel must be email, telegram, voice_call, or webhook".into(),
         ));
     }
+    if let Some(policy_id) = rule.escalation_policy_id {
+        let valid = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM escalation_policies WHERE id=$1 AND project_id=$2)",
+        )
+        .bind(policy_id)
+        .bind(project_id)
+        .fetch_one(&state.db)
+        .await?;
+        if !valid {
+            return Err(AppError::BadRequest(
+                "escalation policy does not belong to project".into(),
+            ));
+        }
+    }
     let row = sqlx::query_as::<_, AlertRuleView>(
-        r#"INSERT INTO alert_rules (project_id, name, level, message_contains, environment, cooldown_seconds, channel, target,threshold_count,window_seconds,notify_recovery)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-           RETURNING id, project_id, name, level, message_contains, environment, cooldown_seconds, channel, target, enabled"#,
+        r#"INSERT INTO alert_rules (project_id, name, level, message_contains, environment, cooldown_seconds, channel, target,threshold_count,window_seconds,notify_recovery,escalation_policy_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+           RETURNING id, project_id, name, level, message_contains, environment, cooldown_seconds, channel, target, enabled, escalation_policy_id"#,
     ).bind(project_id).bind(rule.name).bind(rule.level).bind(rule.message_contains).bind(rule.environment)
     .bind(rule.cooldown_seconds.unwrap_or(300).max(0)).bind(rule.channel).bind(rule.target)
-    .bind(rule.threshold_count).bind(rule.window_seconds).bind(rule.notify_recovery)
+    .bind(rule.threshold_count).bind(rule.window_seconds).bind(rule.notify_recovery).bind(rule.escalation_policy_id)
     .fetch_one(&state.db).await?;
     crate::operations::audit(
         &state.db,
@@ -1555,7 +2058,7 @@ async fn list_rules(
     headers: HeaderMap,
 ) -> Result<Json<Vec<AlertRuleView>>> {
     crate::auth::authorize_project(&state.db, &headers, project_id).await?;
-    let rows = sqlx::query_as::<_, AlertRuleView>("SELECT id, project_id, name, level, message_contains, environment, cooldown_seconds, channel, target, enabled FROM alert_rules WHERE project_id = $1 ORDER BY created_at DESC")
+    let rows = sqlx::query_as::<_, AlertRuleView>("SELECT id, project_id, name, level, message_contains, environment, cooldown_seconds, channel, target, enabled, escalation_policy_id FROM alert_rules WHERE project_id = $1 ORDER BY created_at DESC")
         .bind(project_id).fetch_all(&state.db).await?;
     Ok(Json(rows))
 }
@@ -1573,6 +2076,7 @@ struct UpdateAlertRule {
     threshold_count: Option<i32>,
     window_seconds: Option<i32>,
     notify_recovery: Option<bool>,
+    escalation_policy_id: Option<Uuid>,
 }
 
 async fn update_rule(
@@ -1592,13 +2096,27 @@ async fn update_rule(
     if body
         .channel
         .as_deref()
-        .is_some_and(|c| !matches!(c, "email" | "telegram" | "voice_call"))
+        .is_some_and(|c| !matches!(c, "email" | "telegram" | "voice_call" | "webhook"))
     {
         return Err(AppError::BadRequest(
-            "channel must be email, telegram, or voice_call".into(),
+            "channel must be email, telegram, voice_call, or webhook".into(),
         ));
     }
-    let row=sqlx::query_as::<_,AlertRuleView>("UPDATE alert_rules SET name=COALESCE($2,name),level=COALESCE($3,level),message_contains=COALESCE($4,message_contains),environment=COALESCE($5,environment),cooldown_seconds=COALESCE($6,cooldown_seconds),channel=COALESCE($7,channel),target=COALESCE($8,target),enabled=COALESCE($9,enabled),threshold_count=COALESCE($10,threshold_count),window_seconds=COALESCE($11,window_seconds),notify_recovery=COALESCE($12,notify_recovery) WHERE id=$1 RETURNING id,project_id,name,level,message_contains,environment,cooldown_seconds,channel,target,enabled").bind(rule_id).bind(body.name).bind(body.level).bind(body.message_contains).bind(body.environment).bind(body.cooldown_seconds).bind(body.channel).bind(body.target).bind(body.enabled).bind(body.threshold_count).bind(body.window_seconds).bind(body.notify_recovery).fetch_one(&state.db).await?;
+    if let Some(policy_id) = body.escalation_policy_id {
+        let valid = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM escalation_policies WHERE id=$1 AND project_id=$2)",
+        )
+        .bind(policy_id)
+        .bind(project_id)
+        .fetch_one(&state.db)
+        .await?;
+        if !valid {
+            return Err(AppError::BadRequest(
+                "escalation policy does not belong to project".into(),
+            ));
+        }
+    }
+    let row=sqlx::query_as::<_,AlertRuleView>("UPDATE alert_rules SET name=COALESCE($2,name),level=COALESCE($3,level),message_contains=COALESCE($4,message_contains),environment=COALESCE($5,environment),cooldown_seconds=COALESCE($6,cooldown_seconds),channel=COALESCE($7,channel),target=COALESCE($8,target),enabled=COALESCE($9,enabled),threshold_count=COALESCE($10,threshold_count),window_seconds=COALESCE($11,window_seconds),notify_recovery=COALESCE($12,notify_recovery),escalation_policy_id=COALESCE($13,escalation_policy_id) WHERE id=$1 RETURNING id,project_id,name,level,message_contains,environment,cooldown_seconds,channel,target,enabled,escalation_policy_id").bind(rule_id).bind(body.name).bind(body.level).bind(body.message_contains).bind(body.environment).bind(body.cooldown_seconds).bind(body.channel).bind(body.target).bind(body.enabled).bind(body.threshold_count).bind(body.window_seconds).bind(body.notify_recovery).bind(body.escalation_policy_id).fetch_one(&state.db).await?;
     crate::operations::audit(
         &state.db,
         &user,

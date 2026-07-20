@@ -7,6 +7,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://sentry:sentry@127.0.0.1:5432/open_sentry
     services:
       postgres:
         image: postgres:17-alpine
@@ -30,10 +32,36 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: cargo fmt --check
       - run: cargo test
+      - run: cargo test --test api_integration -- --ignored --test-threads=1
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: npm ci && npm test && npm run lint
         working-directory: frontend
       - run: npm audit --audit-level=high
         working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - name: Start application for browser E2E
+        run: |
+          APP__BIND_ADDR=127.0.0.1:8080 \
+          APP__DATABASE_URL="$DATABASE_URL" \
+          APP__INGEST_API_KEY=dev-secret \
+          APP__PUBLIC_BASE_URL=http://localhost:3000 \
+          APP__BOOTSTRAP_ADMIN_EMAIL=integration@example.com \
+          APP__BOOTSTRAP_ADMIN_PASSWORD=integration-password \
+          nohup cargo run --bin open-sentry > /tmp/open-sentry-backend.log 2>&1 &
+          cd frontend
+          BACKEND_API_URL=http://127.0.0.1:8080 nohup npm run dev > /tmp/open-sentry-frontend.log 2>&1 &
+          for i in {1..60}; do
+            curl --fail --silent http://127.0.0.1:8080/health >/dev/null && \
+            curl --fail --silent http://localhost:3000/ >/dev/null && exit 0
+            sleep 1
+          done
+          cat /tmp/open-sentry-backend.log /tmp/open-sentry-frontend.log
+          exit 1
+      - run: npm run test:e2e
+        working-directory: frontend
+        env:
+          E2E_ADMIN_EMAIL: integration@example.com
+          E2E_ADMIN_PASSWORD: integration-password
       - run: docker build --tag open-sentry-backend:test .
       - run: docker build --tag open-sentry-frontend:test ./frontend

@@ -1,15 +1,3 @@
-mod alert;
-mod api;
-mod auth;
-mod config;
-mod envelope;
-mod error;
-mod model;
-mod notification;
-mod operations;
-mod state;
-mod telemetry;
-
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -18,7 +6,9 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::{config::Settings, state::AppState};
+use open_sentry::{
+    api, auth, config::Settings, notification, operations, state::AppState, symbols,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,6 +40,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move { notification::run_worker(worker_state).await });
     let retention_state = state.clone();
     tokio::spawn(async move { operations::run_retention_worker(retention_state).await });
+    let symbol_state = state.clone();
+    tokio::spawn(async move { symbols::run_worker(symbol_state).await });
 
     let listener = TcpListener::bind(&settings.bind_addr).await?;
     info!(address = %settings.bind_addr, "open-sentry listening");

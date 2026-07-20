@@ -81,6 +81,8 @@ pub struct StoredEvent {
     pub tags: Value,
     pub contexts: Value,
     pub exception: Value,
+    pub symbolicated_exception: Option<Value>,
+    pub symbolication_status: String,
     pub received_at: DateTime<Utc>,
     pub occurred_at: DateTime<Utc>,
 }
@@ -123,6 +125,7 @@ pub struct CreateAlertRule {
     pub cooldown_seconds: Option<i32>,
     pub channel: String,
     pub target: String,
+    pub escalation_policy_id: Option<Uuid>,
     pub threshold_count: Option<i32>,
     pub window_seconds: Option<i32>,
     #[serde(default)]
@@ -141,6 +144,7 @@ pub struct AlertRuleView {
     pub channel: String,
     pub target: String,
     pub enabled: bool,
+    pub escalation_policy_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

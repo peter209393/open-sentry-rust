@@ -1,8 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
+use hmac::{Hmac, Mac};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::Mailbox};
 use serde_json::Value;
+use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::state::AppState;
@@ -14,6 +16,9 @@ struct Job {
     target: String,
     payload: Value,
     attempts: i32,
+    rule_id: Uuid,
+    escalation_policy_id: Option<Uuid>,
+    escalation_step: i32,
 }
 
 pub fn channel_configuration_error(
@@ -42,6 +47,10 @@ pub fn channel_configuration_error(
         {
             Some("Twilio account SID/auth token/from number is incomplete".into())
         }
+        "webhook" => target
+            .parse::<Uuid>()
+            .err()
+            .map(|_| "webhook target must be an endpoint id".into()),
         "email" | "telegram" | "voice_call" => None,
         _ => Some("unsupported notification channel".into()),
     }
@@ -82,7 +91,7 @@ async fn process_batch(state: &AppState) -> anyhow::Result<()> {
            )
            UPDATE notification_outbox AS n SET status = 'processing', claimed_at = now()
            FROM claimed WHERE n.id = claimed.id
-           RETURNING n.id, n.channel, n.target, n.payload, n.attempts"#,
+           RETURNING n.id, n.channel, n.target, n.payload, n.attempts, n.rule_id, n.escalation_policy_id, n.escalation_step"#,
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -102,8 +111,24 @@ async fn process_batch(state: &AppState) -> anyhow::Result<()> {
                 let delay = 2_i64.pow((job.attempts as u32).min(8));
                 sqlx::query("UPDATE notification_outbox SET status = CASE WHEN attempts >= 7 THEN 'failed' ELSE 'pending' END, attempts=attempts+1, last_error=$2, available_at=now()+$3*interval '1 second' WHERE id=$1")
                     .bind(job.id).bind(error.to_string()).bind(delay).execute(&state.db).await?;
+                if job.attempts >= 7 {
+                    enqueue_next_escalation(state, &job).await?;
+                }
             }
         }
+    }
+    Ok(())
+}
+
+async fn enqueue_next_escalation(state: &AppState, job: &Job) -> anyhow::Result<()> {
+    let Some(policy_id) = job.escalation_policy_id else {
+        return Ok(());
+    };
+    let next = job.escalation_step + 1;
+    let row=sqlx::query_as::<_,(String,String,i32)>(r#"SELECT s.channel,COALESCE(s.target,u.email),s.delay_seconds FROM escalation_steps s LEFT JOIN LATERAL (SELECT u.email FROM on_call_members m JOIN users u ON u.id=m.user_id WHERE m.schedule_id=s.schedule_id AND u.active ORDER BY m.rotation_order LIMIT 1) u ON true WHERE s.policy_id=$1 AND s.step_order=$2"#).bind(policy_id).bind(next).fetch_optional(&state.db).await?;
+    if let Some((channel, target, delay)) = row {
+        let dedup = format!("escalation:{}:{}", job.id, next);
+        sqlx::query("INSERT INTO notification_outbox(rule_id,channel,target,payload,escalation_policy_id,escalation_step,available_at,dedup_key) VALUES($1,$2,$3,$4,$5,$6,now()+$7*interval '1 second',$8) ON CONFLICT(dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING").bind(job.rule_id).bind(channel).bind(target).bind(&job.payload).bind(policy_id).bind(next).bind(delay).bind(dedup).execute(&state.db).await?;
     }
     Ok(())
 }
@@ -123,8 +148,52 @@ async fn send(state: &AppState, job: &Job) -> anyhow::Result<()> {
         "telegram" => send_telegram(state, &job.target, &body).await,
         "email" => send_email(state, &job.target, &subject, &body).await,
         "voice_call" => send_voice_call(state, &job.target, &job.payload).await,
+        "webhook" => send_webhook(state, job).await,
         other => Err(anyhow!("unsupported notification channel: {other}")),
     }
+}
+
+async fn send_webhook(state: &AppState, job: &Job) -> anyhow::Result<()> {
+    let endpoint_id = job
+        .target
+        .parse::<Uuid>()
+        .context("webhook target must be an endpoint id")?;
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT url,signing_secret FROM webhook_endpoints WHERE id=$1 AND enabled",
+    )
+    .bind(endpoint_id)
+    .fetch_optional(&state.db)
+    .await?
+    .context("webhook endpoint is disabled or missing")?;
+    let body = serde_json::to_vec(&job.payload)?;
+    let signature = webhook_signature(&row.1, &body)?;
+    let result = state
+        .http
+        .post(&row.0)
+        .header("content-type", "application/json")
+        .header("x-open-sentry-signature", signature)
+        .header("x-open-sentry-delivery", job.id.to_string())
+        .body(body)
+        .send()
+        .await;
+    match result {
+        Ok(response) => {
+            let code = response.status().as_u16() as i32;
+            sqlx::query("INSERT INTO webhook_deliveries(endpoint_id,notification_id,status_code) VALUES($1,$2,$3)").bind(endpoint_id).bind(job.id).bind(code).execute(&state.db).await?;
+            response.error_for_status()?;
+            Ok(())
+        }
+        Err(error) => {
+            sqlx::query("INSERT INTO webhook_deliveries(endpoint_id,notification_id,error) VALUES($1,$2,$3)").bind(endpoint_id).bind(job.id).bind(error.to_string()).execute(&state.db).await?;
+            Err(error.into())
+        }
+    }
+}
+
+fn webhook_signature(secret: &str, body: &[u8]) -> anyhow::Result<String> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
+    mac.update(body);
+    Ok(format!("sha256={:x}", mac.finalize().into_bytes()))
 }
 
 fn is_e164(number: &str) -> bool {
@@ -246,6 +315,20 @@ mod tests {
         assert!(is_e164("+60123456789"));
         assert!(!is_e164("012-3456789"));
         assert!(!is_e164("+60abc"));
+    }
+
+    #[test]
+    fn webhook_signatures_are_deterministic_and_body_bound() {
+        let first = webhook_signature("secret", br#"{"event":"alert"}"#).unwrap();
+        assert_eq!(
+            first,
+            webhook_signature("secret", br#"{"event":"alert"}"#).unwrap()
+        );
+        assert_ne!(
+            first,
+            webhook_signature("secret", br#"{"event":"resolved"}"#).unwrap()
+        );
+        assert!(first.starts_with("sha256="));
     }
 
     #[test]

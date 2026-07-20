@@ -10,6 +10,7 @@ struct MatchingRule {
     name: String,
     channel: String,
     target: String,
+    escalation_policy_id: Option<Uuid>,
 }
 
 pub async fn enqueue_matching_alerts(
@@ -20,7 +21,7 @@ pub async fn enqueue_matching_alerts(
     event: &IngestEvent,
 ) -> Result<()> {
     let rules = sqlx::query_as::<_, MatchingRule>(
-        r#"SELECT id, name, channel, target FROM alert_rules
+        r#"SELECT id, name, channel, target, escalation_policy_id FROM alert_rules
            WHERE project_id = $1 AND enabled
              AND (level IS NULL OR level = $2)
              AND (message_contains IS NULL OR $3 ILIKE '%' || message_contains || '%')
@@ -41,8 +42,13 @@ pub async fn enqueue_matching_alerts(
             "rule_name": rule.name, "project_id": project_id, "issue_id": issue_id,
             "event_id": event_id, "level": event.level, "message": event.message,
         });
-        sqlx::query("INSERT INTO notification_outbox (rule_id, channel, target, payload) VALUES ($1, $2, $3, $4)")
-            .bind(rule.id).bind(rule.channel).bind(rule.target).bind(payload)
+        let (channel, target, delay) = if let Some(policy_id) = rule.escalation_policy_id {
+            sqlx::query_as::<_,(String,String,i32)>(r#"SELECT s.channel,COALESCE(s.target,u.email),s.delay_seconds FROM escalation_steps s LEFT JOIN LATERAL (SELECT u.email FROM on_call_members m JOIN users u ON u.id=m.user_id WHERE m.schedule_id=s.schedule_id AND u.active ORDER BY m.rotation_order LIMIT 1) u ON true WHERE s.policy_id=$1 AND s.step_order=0"#).bind(policy_id).fetch_optional(&mut **tx).await?.ok_or_else(||crate::error::AppError::BadRequest("escalation policy has no resolvable first step".into()))?
+        } else {
+            (rule.channel, rule.target, 0)
+        };
+        sqlx::query("INSERT INTO notification_outbox (rule_id, channel, target, payload, escalation_policy_id, escalation_step, available_at) VALUES ($1, $2, $3, $4, $5, 0, now()+$6*interval '1 second')")
+            .bind(rule.id).bind(channel).bind(target).bind(payload).bind(rule.escalation_policy_id).bind(delay)
             .execute(&mut **tx).await?;
         sqlx::query("UPDATE alert_rules SET last_triggered_at = now() WHERE id = $1")
             .bind(rule.id)

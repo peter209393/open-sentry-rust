@@ -72,6 +72,8 @@ type Event = {
   tags: Record<string, unknown>;
   contexts: Record<string, unknown>;
   exception: Record<string, unknown>;
+  symbolicated_exception?: Record<string, unknown>;
+  symbolication_status: string;
   received_at: string;
   occurred_at: string;
 };
@@ -79,9 +81,9 @@ type ProjectInfo = { id:string; external_id:number; name:string; slug:string; cr
 type ServiceInfo = { id:string; name:string; environment:string; latest_release?:string; sdk_name?:string; sdk_version?:string; runtime:Record<string,unknown>; event_count:number; log_count:number; issue_count:number; first_seen:string; last_seen:string };
 type LogEntry = { id:string; service?:string; environment?:string; occurred_at:string; level:string; body:string; trace_id?:string; attributes:Record<string,unknown> };
 type StreamEvent = { id:string; issue_id:string; service?:string; level:string; message:string; environment?:string; release?:string; trace_id?:string; occurred_at:string };
-type View = "overview" | "issues" | "services" | "events" | "logs" | "projects" | "users" | "alerts" | "audit" | "setup" | "settings";
+type View = "overview" | "issues" | "services" | "events" | "logs" | "releases" | "integrations" | "projects" | "users" | "alerts" | "audit" | "setup" | "settings";
 type User = { id:string; email:string; display_name:string; role:string };
-type AlertRule = { id:string; name:string; level?:string; environment?:string; cooldown_seconds:number; channel:string; target:string; enabled:boolean };
+type AlertRule = { id:string; name:string; level?:string; environment?:string; cooldown_seconds:number; channel:string; target:string; enabled:boolean; escalation_policy_id?:string };
 type AuditLog = { id:string; actor_email?:string; action:string; resource_type:string; resource_id?:string; metadata:Record<string,unknown>; occurred_at:string };
 type RuntimeConfig = { environment:string; ingest_rate_limit_per_minute:number; retention_days:number; secure_cookies:boolean };
 type ProjectListItem = {id:string;external_id:number;name:string;slug:string;retention_days?:number;archived_at?:string;created_at:string};
@@ -90,6 +92,11 @@ type ProjectKey = {id:string;name:string;created_at:string;last_used_at?:string;
 type Notification = {id:string;rule_name:string;channel:string;status:string;attempts:number;last_error?:string;created_at:string};
 type IssueComment = {id:string;author:string;body:string;created_at:string};
 type UserSession = {id:string;created_at:string;last_seen_at:string;expires_at:string};
+type Release = {id:string;version:string;description?:string;event_count:number;first_event_at?:string;last_event_at?:string;created_at:string};
+type DebugFile = {id:string;kind:string;name:string;debug_id?:string;checksum:string;status:string;error?:string;release?:string;created_at:string};
+type WebhookEndpoint = {id:string;name:string;url:string;enabled:boolean;delivery_count:number;created_at:string};
+type OnCallSchedule = {id:string;name:string;timezone:string;members:Array<{user_id:string;email:string;display_name:string;rotation_order:number}>};
+type EscalationPolicy = {id:string;name:string;steps:Array<{order:number;delay_seconds:number;channel:string;target?:string;schedule_id?:string}>};
 
 const emptyOverview: Overview = {
   total_events: 0,
@@ -177,6 +184,11 @@ export default function Home() {
   const [ruleName, setRuleName] = useState("");
   const [ruleTarget, setRuleTarget] = useState("");
   const [ruleChannel, setRuleChannel] = useState("email");
+  const [releases,setReleases]=useState<Release[]>([]); const [debugFiles,setDebugFiles]=useState<DebugFile[]>([]);
+  const [releaseVersion,setReleaseVersion]=useState(""); const [releaseDescription,setReleaseDescription]=useState(""); const [symbolRelease,setSymbolRelease]=useState("");
+  const [webhooks,setWebhooks]=useState<WebhookEndpoint[]>([]); const [schedules,setSchedules]=useState<OnCallSchedule[]>([]); const [policies,setPolicies]=useState<EscalationPolicy[]>([]);
+  const [webhookName,setWebhookName]=useState(""); const [webhookUrl,setWebhookUrl]=useState(""); const [webhookSecret,setWebhookSecret]=useState("");
+  const [policyName,setPolicyName]=useState(""); const [policyTarget,setPolicyTarget]=useState(""); const [policyChannel,setPolicyChannel]=useState("email");
   const sentryDsn = process.env.NEXT_PUBLIC_SENTRY_DSN ?? "http://dev-secret@localhost:8080/1";
 
   useEffect(() => {
@@ -243,11 +255,13 @@ export default function Home() {
 
   useEffect(() => {
     if (!user) return;
-    if (view === "alerts") { api<AlertRule[]>(`/api/projects/${projectId}/alert-rules`).then(setAlertRules).catch(()=>setAlertRules([])); api<Notification[]>(`/api/projects/${projectId}/notifications`).then(setNotifications).catch(()=>setNotifications([])); }
+    if (view === "alerts") { api<AlertRule[]>(`/api/projects/${projectId}/alert-rules`).then(setAlertRules).catch(()=>setAlertRules([])); api<Notification[]>(`/api/projects/${projectId}/notifications`).then(setNotifications).catch(()=>setNotifications([])); api<EscalationPolicy[]>(`/api/projects/${projectId}/escalation-policies`).then(setPolicies).catch(()=>setPolicies([])); }
     if (view === "projects" || view === "settings") { api<ProjectListItem[]>("/api/projects").then(setProjects); api<ProjectKey[]>(`/api/projects/${projectId}/keys`).then(setProjectKeys); }
     if (view === "users") api<ManagedUser[]>("/api/users").then(setManagedUsers).catch(()=>setManagedUsers([]));
     if (view === "audit") api<AuditLog[]>("/api/audit-logs?limit=100").then(setAuditLogs).catch(()=>setAuditLogs([]));
     if (view === "settings") api<RuntimeConfig>("/api/runtime-config").then(setRuntimeConfig).catch(()=>setRuntimeConfig(null));
+    if (view === "releases") { api<Release[]>(`/api/projects/${projectId}/releases`).then(setReleases).catch(()=>setReleases([])); api<DebugFile[]>(`/api/projects/${projectId}/debug-files`).then(setDebugFiles).catch(()=>setDebugFiles([])); }
+    if (view === "integrations") { api<WebhookEndpoint[]>(`/api/projects/${projectId}/webhooks`).then(setWebhooks).catch(()=>setWebhooks([])); api<OnCallSchedule[]>(`/api/projects/${projectId}/on-call-schedules`).then(setSchedules).catch(()=>setSchedules([])); api<EscalationPolicy[]>(`/api/projects/${projectId}/escalation-policies`).then(setPolicies).catch(()=>setPolicies([])); }
   }, [view, user, projectId]);
 
   async function createAlertRule(event: React.FormEvent) {
@@ -257,13 +271,18 @@ export default function Home() {
     setAlertRules(items=>[created,...items]); setRuleName(""); setRuleTarget("");
   }
 
+  async function createReleaseEntry(e:React.FormEvent){e.preventDefault();await api(`/api/projects/${projectId}/releases`,{method:"POST",body:JSON.stringify({version:releaseVersion,description:releaseDescription||null})});setReleaseVersion("");setReleaseDescription("");setReleases(await api<Release[]>(`/api/projects/${projectId}/releases`));}
+  async function uploadSymbols(e:React.FormEvent<HTMLFormElement>){e.preventDefault();const input=e.currentTarget.elements.namedItem("symbolFile") as HTMLInputElement;const file=input.files?.[0];if(!file)return;const response=await fetch(`${API_URL}/api/projects/${projectId}/debug-files`,{method:"POST",headers:{"x-debug-file-kind":file.name.endsWith(".map")?"source_map":"native_symbol","x-debug-file-name":file.name,"x-release":symbolRelease},body:file});if(!response.ok)throw new Error(await response.text());input.value="";setDebugFiles(await api<DebugFile[]>(`/api/projects/${projectId}/debug-files`));}
+  async function createWebhookEndpoint(e:React.FormEvent){e.preventDefault();const result=await api<{id:string;signing_secret:string}>(`/api/projects/${projectId}/webhooks`,{method:"POST",body:JSON.stringify({name:webhookName,url:webhookUrl})});setWebhookSecret(result.signing_secret);setWebhookName("");setWebhookUrl("");setWebhooks(await api<WebhookEndpoint[]>(`/api/projects/${projectId}/webhooks`));}
+  async function createEscalationPolicy(e:React.FormEvent){e.preventDefault();await api(`/api/projects/${projectId}/escalation-policies`,{method:"POST",body:JSON.stringify({name:policyName,steps:[{delay_seconds:0,channel:policyChannel,target:policyTarget}]})});setPolicyName("");setPolicyTarget("");setPolicies(await api<EscalationPolicy[]>(`/api/projects/${projectId}/escalation-policies`));}
+
   async function createProject(e:React.FormEvent){e.preventDefault();const p=await api<ProjectListItem>("/api/projects",{method:"POST",body:JSON.stringify({name:newProjectName,slug:newProjectSlug})});setProjects(v=>[...v,p]);setNewProjectName("");setNewProjectSlug("");setProjectId(p.id);}
   async function rotateKey(){const result=await api<{dsn:string}>(`/api/projects/${projectId}/keys`,{method:"POST",body:JSON.stringify({name:`Console key ${new Date().toLocaleDateString()}`})});setCreatedDsn(result.dsn);setProjectKeys(await api<ProjectKey[]>(`/api/projects/${projectId}/keys`));}
   async function toggleRule(rule:AlertRule){const next=await api<AlertRule>(`/api/alert-rules/${rule.id}`,{method:"PATCH",body:JSON.stringify({enabled:!rule.enabled})});setAlertRules(v=>v.map(r=>r.id===rule.id?next:r));}
   async function resolveCurrentPage(){if(!visibleIssues.length||!canManage)return;await api("/api/issues/batch",{method:"PATCH",body:JSON.stringify({issue_ids:visibleIssues.map(i=>i.id),status:"resolved"})});await load(true);}
   async function addComment(e:React.FormEvent){e.preventDefault();if(!selected)return;const created=await api<IssueComment>(`/api/issues/${selected.id}/comments`,{method:"POST",body:JSON.stringify({body:commentBody})});setComments(v=>[...v,created]);setCommentBody("");}
   async function archiveProject(id:string){if(!confirm("归档项目并立即吊销全部 DSN Key？"))return;await api(`/api/projects/${id}`,{method:"DELETE"});setProjects(v=>v.map(p=>p.id===id?{...p,archived_at:new Date().toISOString()}:p));}
-  async function editRule(rule:AlertRule){const name=prompt("规则名称",rule.name);if(!name)return;const target=prompt("通知目标",rule.target);if(!target)return;const next=await api<AlertRule>(`/api/alert-rules/${rule.id}`,{method:"PATCH",body:JSON.stringify({name,target})});setAlertRules(v=>v.map(r=>r.id===rule.id?next:r));}
+  async function editRule(rule:AlertRule){const name=prompt("规则名称",rule.name);if(!name)return;const target=prompt("通知目标",rule.target);if(!target)return;const policy=prompt(`升级策略 ID（可选）\n${policies.map(p=>`${p.name}: ${p.id}`).join("\n")}`,rule.escalation_policy_id??"");const next=await api<AlertRule>(`/api/alert-rules/${rule.id}`,{method:"PATCH",body:JSON.stringify({name,target,escalation_policy_id:policy||undefined})});setAlertRules(v=>v.map(r=>r.id===rule.id?next:r));}
   async function deleteRule(rule:AlertRule){if(!confirm(`删除规则 ${rule.name}？`))return;await api(`/api/alert-rules/${rule.id}`,{method:"DELETE"});setAlertRules(v=>v.filter(r=>r.id!==rule.id));}
   async function savePolicy(e:React.FormEvent){e.preventDefault();await api(`/api/projects/${projectId}`,{method:"PATCH",body:JSON.stringify({retention_days:Number(policyRetention),scrub_fields:policyScrub.split(",").map(v=>v.trim()).filter(Boolean)})});}
   async function loadUserSessions(userId:string){const sessions=await api<UserSession[]>(`/api/users/${userId}/sessions`);setUserSessions(v=>({...v,[userId]:sessions}));}
@@ -333,10 +352,12 @@ export default function Home() {
           <button className={`nav-item ${view === "services" ? "active" : ""}`} onClick={() => setView("services")}><Server size={17} />Services <span className="nav-count">{services.length}</span></button>
           <button className={`nav-item ${view === "events" ? "active" : ""}`} onClick={() => setView("events")}><Activity size={17} />Events</button>
           <button className={`nav-item ${view === "logs" ? "active" : ""}`} onClick={() => setView("logs")}><TerminalSquare size={17} />Logs</button>
+          <button className={`nav-item ${view === "releases" ? "active" : ""}`} onClick={() => setView("releases")}><Code2 size={17} />Releases</button>
           <p className="nav-label nav-gap">管理</p>
           <button className={`nav-item ${view === "projects" ? "active" : ""}`} onClick={()=>setView("projects")}><FolderKanban size={17}/>项目管理</button>
           {canManage&&<button className={`nav-item ${view === "users" ? "active" : ""}`} onClick={()=>setView("users")}><UserRoundCog size={17}/>成员权限</button>}
           <button className={`nav-item ${view === "alerts" ? "active" : ""}`} onClick={()=>setView("alerts")}><Bell size={17} />告警规则</button>
+          <button className={`nav-item ${view === "integrations" ? "active" : ""}`} onClick={()=>setView("integrations")}><ExternalLink size={17} />集成与值班</button>
           <button className={`nav-item ${view === "audit" ? "active" : ""}`} onClick={()=>setView("audit")}><ScrollText size={17} />审计日志</button>
           <button className={`nav-item ${view === "setup" ? "active" : ""}`} onClick={()=>setView("setup")}><TerminalSquare size={17} />SDK 接入</button>
           <button className={`nav-item ${view === "settings" ? "active" : ""}`} onClick={()=>setView("settings")}><Settings size={17} />项目设置</button>
@@ -353,7 +374,7 @@ export default function Home() {
       <main className="main-content">
         <header className="topbar">
           <button className="menu-button" onClick={() => setMenuOpen(true)} aria-label="打开菜单"><Menu /></button>
-          <div className="page-title"><span className="eyebrow">{project?.name ?? "Demo Project"} /</span><h1>{{ overview:"运行概览", issues:"Issues", services:"Services", events:"事件流", logs:"Logs",projects:"项目管理",users:"成员权限",alerts:"告警规则",audit:"审计日志",setup:"SDK 接入",settings:"项目设置" }[view]}</h1></div>
+          <div className="page-title"><span className="eyebrow">{project?.name ?? "Demo Project"} /</span><h1>{{ overview:"运行概览", issues:"Issues", services:"Services", events:"事件流", logs:"Logs",releases:"Releases 与符号",integrations:"集成与值班",projects:"项目管理",users:"成员权限",alerts:"告警规则",audit:"审计日志",setup:"SDK 接入",settings:"项目设置" }[view]}</h1></div>
           <div className="topbar-actions">
             <span className={`health-pill ${error ? "offline" : ""}`}><span />{error ? "连接中断" : "系统正常"}</span>
             <button className="icon-button" onClick={() => load(true)} aria-label="刷新数据"><RefreshCw className={refreshing ? "spin" : ""} size={18} /></button>
@@ -427,6 +448,10 @@ export default function Home() {
             {view === "logs" ? <section className="panel log-console"><div className="log-head"><span>时间</span><span>Level</span><span>Service</span><span>日志正文</span><span>Trace ID</span></div>{logs.map(log=><details className="log-line" key={log.id}><summary><time>{new Date(log.occurred_at).toLocaleTimeString("zh-CN",{hour12:false})}</time><span className={`log-level ${levelClass(log.level)}`}>{log.level}</span><button onClick={(e)=>{e.preventDefault();setServiceFilter(log.service??"");}}>{log.service??"unknown-service"}</button><strong>{log.body}</strong><code>{log.trace_id?.slice(0,12)??"—"}</code></summary><pre>{JSON.stringify(log.attributes,null,2)}</pre></details>)}{!logs.length&&<div className="empty-state"><TerminalSquare/><strong>没有匹配的日志</strong><span>调整筛选条件或运行 sentry-smoke。</span></div>}</section>
             : <section className="panel event-stream"><div className="log-head event-head"><span>时间</span><span>Level</span><span>Service</span><span>事件</span><span>Release / Trace</span></div>{streamEvents.map(event=><button className="event-line" key={event.id} onClick={()=>{const issue=issues.find(i=>i.id===event.issue_id);if(issue)setSelected(issue);}}><time>{new Date(event.occurred_at).toLocaleTimeString("zh-CN",{hour12:false})}</time><span className={`log-level ${levelClass(event.level)}`}>{event.level}</span><span>{event.service??"unknown-service"}</span><strong>{event.message}</strong><code>{event.release??event.trace_id?.slice(0,12)??"—"}</code></button>)}</section>}
           </div>}
+
+          {view === "releases"&&<div className="management-grid"><section className="panel management-panel"><p className="section-kicker">RELEASE HEALTH</p><h2>版本与部署基线</h2><div className="rule-list">{releases.map(r=><article key={r.id}><span className="project-avatar">R</span><span><strong>{r.version}</strong><small>{r.event_count} events · {r.last_event_at?relativeTime(r.last_event_at):"尚无事件"} {r.description}</small></span></article>)}</div>{canManage&&<form className="settings-form" onSubmit={createReleaseEntry}><label>版本<input required value={releaseVersion} onChange={e=>setReleaseVersion(e.target.value)}/></label><label>说明<input value={releaseDescription} onChange={e=>setReleaseDescription(e.target.value)}/></label><button>创建 Release</button></form>}</section><section className="panel management-panel"><p className="section-kicker">SYMBOLICATION</p><h2>调试文件</h2><p>上传 Source Map 或 ELF、Mach-O、PDB；匹配事件将自动重新解析。</p>{canManage&&<form className="settings-form" onSubmit={uploadSymbols}><label>关联 Release<input required value={symbolRelease} onChange={e=>setSymbolRelease(e.target.value)}/></label><label>符号文件<input name="symbolFile" type="file" required/></label><button>上传并验证</button></form>}<div className="rule-list">{debugFiles.map(f=><article key={f.id}><span className={`status-dot ${f.status==="ready"?"on":""}`}/><span><strong>{f.name}</strong><small>{f.kind} · {f.release??"unbound"} · {f.status}</small></span></article>)}</div></section></div>}
+
+          {view === "integrations"&&<div className="management-grid"><section className="panel management-panel"><p className="section-kicker">SIGNED WEBHOOKS</p><h2>Webhook 端点</h2><div className="rule-list">{webhooks.map(h=><article key={h.id}><span className={`status-dot ${h.enabled?"on":""}`}/><span><strong>{h.name}</strong><small>{h.url} · {h.delivery_count} 次投递</small></span><button onClick={()=>api(`/api/webhooks/${h.id}/test`,{method:"POST",body:"{}"})}>测试</button></article>)}</div>{canManage&&<form className="settings-form" onSubmit={createWebhookEndpoint}><label>名称<input required value={webhookName} onChange={e=>setWebhookName(e.target.value)}/></label><label>URL<input required type="url" value={webhookUrl} onChange={e=>setWebhookUrl(e.target.value)}/></label><button>创建端点</button>{webhookSecret&&<div className="dsn-box"><code>{webhookSecret}</code><button type="button" onClick={()=>navigator.clipboard.writeText(webhookSecret)}>复制 Secret</button></div>}</form>}</section><section className="panel management-panel"><p className="section-kicker">ON-CALL & ESCALATION</p><h2>值班与升级策略</h2><div className="rule-list">{schedules.map(s=><article key={s.id}><span className="project-avatar">O</span><span><strong>{s.name}</strong><small>{s.timezone} · {s.members.map(m=>m.display_name).join(" → ")}</small></span></article>)}{policies.map(p=><article key={p.id}><span className="project-avatar">P</span><span><strong>{p.name}</strong><small>{p.steps.map(s=>`${s.delay_seconds}s ${s.channel}`).join(" → ")}</small></span></article>)}</div>{canManage&&<form className="settings-form" onSubmit={createEscalationPolicy}><label>策略名<input required value={policyName} onChange={e=>setPolicyName(e.target.value)}/></label><label>渠道<select value={policyChannel} onChange={e=>setPolicyChannel(e.target.value)}><option value="email">Email</option><option value="telegram">Telegram</option><option value="voice_call">电话</option><option value="webhook">Webhook</option></select></label><label>目标<input required value={policyTarget} onChange={e=>setPolicyTarget(e.target.value)}/></label><button>创建策略</button></form>}</section></div>}
 
           {view === "projects"&&<div className="management-grid"><section className="panel management-panel"><p className="section-kicker">PROJECTS</p><h2>项目与数据边界</h2><div className="rule-list">{projects.filter(p=>!p.archived_at).map(p=><article key={p.id}><span className="project-avatar">{p.name[0]}</span><span><strong>{p.name}</strong><small>{p.slug} · #{p.external_id} · 保留 {p.retention_days??runtimeConfig?.retention_days??30} 天</small></span><button onClick={()=>setProjectId(p.id)}>打开</button>{canManage&&p.id!==projectId&&<button onClick={()=>archiveProject(p.id)}>归档</button>}</article>)}</div></section>{canManage&&<section className="panel management-panel"><p className="section-kicker">CREATE PROJECT</p><h2>创建项目</h2><form className="settings-form" onSubmit={createProject}><label>项目名称<input required value={newProjectName} onChange={e=>setNewProjectName(e.target.value)}/></label><label>Slug<input required pattern="[a-z0-9-]+" value={newProjectSlug} onChange={e=>setNewProjectSlug(e.target.value.toLowerCase())}/></label><button>创建并打开</button></form></section>}</div>}
 
