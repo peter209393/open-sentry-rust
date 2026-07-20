@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sentry
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: open_sentry
+    volumes:
+      - open_sentry_production_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentry -d open_sentry"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [backend]
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP__ENVIRONMENT: production
+      APP__BIND_ADDR: 0.0.0.0:8080
+      APP__DATABASE_URL: postgres://sentry:${POSTGRES_PASSWORD}@postgres:5432/open_sentry
+      APP__INGEST_API_KEY: ${INGEST_API_KEY:?INGEST_API_KEY is required}
+      APP__PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
+      APP__BOOTSTRAP_ADMIN_EMAIL: ${ADMIN_EMAIL:?ADMIN_EMAIL is required}
+      APP__BOOTSTRAP_ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      APP__SECURE_COOKIES: "true"
+      APP__METRICS_API_KEY: ${METRICS_API_KEY:?METRICS_API_KEY is required}
+      APP__INGEST_RATE_LIMIT_PER_MINUTE: ${INGEST_RATE_LIMIT_PER_MINUTE:-600}
+      APP__RETENTION_DAYS: ${RETENTION_DAYS:-30}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    networks: [backend, frontend]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_PROJECT_ID: ${NEXT_PUBLIC_PROJECT_ID:-00000000-0000-0000-0000-000000000001}
+        NEXT_PUBLIC_SENTRY_DSN: ${PUBLIC_SENTRY_DSN:?PUBLIC_SENTRY_DSN is required}
+        BACKEND_API_URL: http://backend:8080
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BACKEND_API_URL: http://backend:8080
+    ports:
+      - "${HTTP_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [frontend]
+
+networks:
+  backend:
+    internal: true
+  frontend:
+
+volumes:
+  open_sentry_production_pg:
