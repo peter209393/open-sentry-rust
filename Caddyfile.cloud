@@ -1,22 +1,7 @@
-# Caddy 反向代理配置
-# 自动申请并续期 Let's Encrypt HTTPS 证书
-# 替换 sentry.example.com 为你的真实域名
-
-sentry.example.com {
-    # SDK 上报 & 后端 API & 健康检查 优先路由到 Rust 后端
+:80 {
     reverse_proxy /api/* backend:8080
     reverse_proxy /health backend:8080
     reverse_proxy /backend-api/* backend:8080
-
-    # 其余流量 -> Next.js 前端
     reverse_proxy frontend:3000
-
     encode gzip zstd
-
-    log {
-        output file /var/log/caddy/access.log {
-            roll_size 10MB
-            roll_keep 5
-        }
-    }
 }
