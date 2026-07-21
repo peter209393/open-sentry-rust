@@ -1,7 +1,14 @@
 :80 {
+    # SDK 上报 & 后端 API（直接路径）
     reverse_proxy /api/* backend:8080
     reverse_proxy /health backend:8080
-    reverse_proxy /backend-api/* backend:8080
+
+    # 前端浏览器 API 代理 - 去掉 /backend-api/ 前缀
+    handle_path /backend-api/* {
+        reverse_proxy backend:8080
+    }
+
+    # 其余流量 -> Next.js 前端
     reverse_proxy frontend:3000
     encode gzip zstd
 }
