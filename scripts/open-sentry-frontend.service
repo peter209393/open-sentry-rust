@@ -1,0 +1,20 @@
+[Unit]
+Description=Open Sentry Next.js Frontend
+After=network-online.target open-sentry-backend.service
+Requires=open-sentry-backend.service
+
+[Service]
+Type=simple
+User=sentry
+Group=sentry
+WorkingDirectory=/opt/open-sentry/frontend
+Environment="BACKEND_API_URL=http://127.0.0.1:8080"
+Environment="NODE_ENV=production"
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/open-sentry/frontend.log
+StandardError=append:/var/log/open-sentry/frontend.log
+
+[Install]
+WantedBy=multi-user.target

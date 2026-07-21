@@ -1,0 +1,20 @@
+[Unit]
+Description=Open Sentry Rust Backend
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=sentry
+Group=sentry
+WorkingDirectory=/opt/open-sentry
+EnvironmentFile=/opt/open-sentry/.env.local
+ExecStart=/opt/open-sentry/target/release/open-sentry
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/open-sentry/backend.log
+StandardError=append:/var/log/open-sentry/backend.log
+
+[Install]
+WantedBy=multi-user.target

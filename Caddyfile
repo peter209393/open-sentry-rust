@@ -1,0 +1,30 @@
+# Caddy 反向代理配置（本地主程序 + Docker 基础设施模式）
+# Caddy 使用 network_mode: host，直接访问宿主机上的 localhost:8080 / localhost:3000
+# 请将 sentry.example.com 替换为你的真实域名
+
+sentry.example.com {
+    # SDK 上报 & 后端 API & 健康检查 -> 本地 Rust 后端
+    handle /api/* {
+        reverse_proxy localhost:8080
+    }
+    handle /health {
+        reverse_proxy localhost:8080
+    }
+    handle /backend-api/* {
+        reverse_proxy localhost:8080
+    }
+
+    # 其余流量 -> 本地 Next.js 前端
+    handle {
+        reverse_proxy localhost:3000
+    }
+
+    encode gzip zstd
+
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10MB
+            roll_keep 5
+        }
+    }
+}

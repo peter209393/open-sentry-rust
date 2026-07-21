@@ -1,0 +1,40 @@
+# ==========================================
+# 基础设施层：PostgreSQL + Caddy（Docker）
+# 主程序（Rust 后端 + Next.js 前端）在宿主机本地运行
+# ==========================================
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    # 只绑定到 127.0.0.1，避免外网直接访问数据库
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: sentry
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: open_sentry
+    volumes:
+      - open_sentry_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentry -d open_sentry"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # 共享宿主机网络，直接监听 80/443，可直接访问 localhost:8080 / localhost:3000
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+
+volumes:
+  open_sentry_pg:
+  caddy_data:
+  caddy_config:
+  caddy_logs:
