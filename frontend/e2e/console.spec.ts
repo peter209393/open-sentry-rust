@@ -11,6 +11,12 @@ test("owner can login and reach production management surfaces", async ({ page }
 
   await page.getByRole("button", { name: "项目管理" }).click();
   await expect(page.getByRole("heading", { name: "项目与数据边界" })).toBeVisible();
+  const suffix = Date.now().toString();
+  await page.getByLabel("项目名称").fill(`E2E Project ${suffix}`);
+  await page.getByLabel("Slug").fill(`e2e-project-${suffix}`);
+  await page.getByRole("button", { name: "创建 Project ID" }).click();
+  await expect(page.getByLabel("切换 Project ID")).toContainText(`E2E Project ${suffix}`);
+  await expect(page.locator(".rule-list article").filter({ hasText: `E2E Project ${suffix}` })).toContainText("Project #");
   await page.getByRole("button", { name: "成员权限" }).click();
   await expect(page.getByRole("heading", { name: "成员与角色" })).toBeVisible();
   await page.getByRole("button", { name: "告警规则" }).click();

@@ -103,6 +103,30 @@ async fn login_ingest_and_rbac_are_database_backed(pool: PgPool) {
     assert_eq!(projects.status(), StatusCode::OK);
     assert!(!response_json(projects).await.as_array().unwrap().is_empty());
 
+    let created_project = app
+        .clone()
+        .oneshot(
+            Request::post("/api/projects")
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"name":"Integration Project","slug":"integration-project"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created_project.status(), StatusCode::CREATED);
+    let created_project = response_json(created_project).await;
+    assert_eq!(created_project["external_id"], 2);
+    assert!(
+        created_project["id"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .is_ok()
+    );
+
     let release = app
         .clone()
         .oneshot(
