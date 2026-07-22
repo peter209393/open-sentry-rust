@@ -1,6 +1,15 @@
 {
   "name": "open-sentry-console",
   "version": "0.1.0",
+  "description": "Web console for the self-hosted, Sentry-compatible Open Sentry Rust monitoring platform",
+  "keywords": [
+    "sentry",
+    "error-monitoring",
+    "observability",
+    "self-hosted",
+    "react",
+    "nextjs"
+  ],
   "private": true,
   "engines": {
     "node": ">=22.13.0"

@@ -2,6 +2,11 @@
 name = "open-sentry"
 version = "0.1.0"
 edition = "2024"
+description = "A self-hosted, Sentry-compatible error monitoring and observability platform"
+readme = "README.md"
+keywords = ["sentry", "observability", "error-monitoring", "self-hosted", "axum"]
+categories = ["web-programming::http-server", "development-tools::debugging"]
+repository = "https://github.com/peter209393/open-sentry-rust"
 
 [dependencies]
 anyhow = "1"
