@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::DefaultBodyLimit,
-    extract::{Path, Query, State},
+    extract::{Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
     middleware,
     response::IntoResponse,
@@ -232,10 +232,16 @@ async fn authorize_project_key(
 async fn ingest_envelope(
     State(state): State<Arc<AppState>>,
     Path(external_project_id): Path<i64>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>)> {
-    let public_key = sentry_key(&headers).ok_or(AppError::Unauthorized)?;
+    // 浏览器 Sentry SDK 把公钥放在 URL query(?sentry_key=)；server-to-server
+    // 放在 X-Sentry-Auth 头。两者都接受。
+    let public_key = sentry_key(&headers)
+        .map(str::to_owned)
+        .or_else(|| query_sentry_key(raw_query.as_deref()))
+        .ok_or(AppError::Unauthorized)?;
     let key_hash = format!("{:x}", Sha256::digest(public_key.as_bytes()));
     let (project_id, key_id) = sqlx::query_as::<_, (Uuid, Uuid)>(
         r#"SELECT p.id, k.id FROM projects p
@@ -298,6 +304,14 @@ fn sentry_key(headers: &HeaderMap) -> Option<&str> {
         .split(',')
         .map(str::trim)
         .find_map(|part| part.strip_prefix("sentry_key="))
+}
+
+fn query_sentry_key(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("sentry_key="))
+        .map(str::to_owned)
 }
 
 fn event_from_payload(payload: &[u8]) -> Result<IngestEvent> {

@@ -104,12 +104,14 @@ pub fn parse(input: &[u8]) -> Result<Vec<EnvelopeItem>> {
 }
 
 fn line(input: &[u8], start: usize) -> Result<(&[u8], usize)> {
-    let relative_end = input[start..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .ok_or_else(|| AppError::BadRequest("unterminated envelope line".into()))?;
-    let end = start + relative_end;
-    Ok((&input[start..end], end + 1))
+    match input[start..].iter().position(|byte| *byte == b'\n') {
+        Some(relative_end) => {
+            let end = start + relative_end;
+            Ok((&input[start..end], end + 1))
+        }
+        // 容忍最后一行无换行结尾（浏览器 Sentry SDK 的 envelope 不带尾换行）
+        None => Ok((&input[start..], input.len())),
+    }
 }
 
 #[cfg(test)]

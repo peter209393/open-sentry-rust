@@ -1,14 +1,23 @@
 :80 {
-    # SDK 上报 & 后端 API（直接路径）
-    reverse_proxy /api/* backend:8080
-    reverse_proxy /health backend:8080
-
-    # 前端浏览器 API 代理 - 去掉 /backend-api/ 前缀
+    # SDK 上报 & 后端 API + CORS（浏览器端 Sentry SDK 需要预检 + ACAO）。
+    # 注：key 走 query 由后端原生支持（api.rs 读 ?sentry_key=），无需 Caddy 兜底。
+    handle /api/* {
+        header Access-Control-Allow-Origin "*"
+        header Access-Control-Allow-Methods "POST, OPTIONS"
+        header Access-Control-Allow-Headers "content-type, x-sentry-auth"
+        header Access-Control-Max-Age "86400"
+        @options method OPTIONS
+        respond @options 204
+        reverse_proxy backend:8080
+    }
+    handle /health {
+        reverse_proxy backend:8080
+    }
     handle_path /backend-api/* {
         reverse_proxy backend:8080
     }
-
-    # 其余流量 -> Next.js 前端
-    reverse_proxy frontend:3000
+    handle {
+        reverse_proxy frontend:3000
+    }
     encode gzip zstd
 }

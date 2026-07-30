@@ -234,7 +234,7 @@ export default function Home() {
   useEffect(() => {
     if (!user) return;
     const initial = window.setTimeout(() => void load(), 0);
-    const timer = window.setInterval(() => load(true), 30_000);
+    const timer = window.setInterval(() => load(true), 1_000);
     return () => {
       window.clearTimeout(initial);
       window.clearInterval(timer);
